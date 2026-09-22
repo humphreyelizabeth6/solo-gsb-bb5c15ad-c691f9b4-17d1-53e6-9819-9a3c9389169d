@@ -132,6 +132,23 @@ CREATE TABLE IF NOT EXISTS event_snapshot_items (
     acked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snapshot_items ON event_snapshot_items(snapshot_id, ord);
+
+-- 规则审计修复工作台：每次成功应用的修复运行（勾选的建议、逐条结果、
+-- 应用前后审计关系变化、规则表快照）。快照用于"撤销最近一次修复"；
+-- 仅 /api/reset 恢复出厂时随全部业务数据一并清空。
+CREATE TABLE IF NOT EXISTS remediation_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    note TEXT DEFAULT '',
+    selected_json TEXT NOT NULL,         -- JSON: 勾选的建议 id（按确定性应用顺序）
+    results_json TEXT NOT NULL,          -- JSON: 每条建议 applied/skipped 及原因
+    diff_json TEXT NOT NULL,             -- JSON: 应用前后审计关系变化
+    before_audit TEXT NOT NULL,          -- JSON: 应用前完整审计结果
+    after_audit TEXT NOT NULL,           -- JSON: 应用后完整审计结果
+    rules_snapshot TEXT NOT NULL,        -- JSON: 应用前 rules 表全量行（撤销恢复用）
+    undone INTEGER NOT NULL DEFAULT 0,
+    undone_at TEXT
+);
 """
 
 _RULE_COLS = [
@@ -277,7 +294,8 @@ def reset_all(conn) -> None:
         conn.executescript(
             "DELETE FROM decisions; DELETE FROM receiver_logs; DELETE FROM staged; "
             "DELETE FROM alerts; DELETE FROM rules; DELETE FROM runs; DELETE FROM events; "
-            "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots;"
+            "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots; "
+            "DELETE FROM remediation_runs;"
         )
         inserted_ids = []
         for rule in seed_rules():
@@ -329,7 +347,8 @@ def init_db(force_seed: bool = False) -> None:
                         "DELETE FROM decisions; DELETE FROM receiver_logs; "
                         "DELETE FROM staged; DELETE FROM alerts; DELETE FROM rules; "
                         "DELETE FROM runs; DELETE FROM events; "
-                        "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots;"
+                        "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots; "
+                        "DELETE FROM remediation_runs;"
                     )
                 for rule in seed_rules():
                     conn.execute(

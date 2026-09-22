@@ -23,6 +23,11 @@ let state = {
   snapshots: [],
   snapCompare: { from: null, to: null, result: null },
   audit: { result: null, filterRuleId: null },
+  remediate: {
+    suggestions: [], unsupported: [], meta: null,
+    history: [], canUndoId: null, lastResult: null,
+    selected: new Set(),
+  },
 };
 
 function eventFilters() {
@@ -605,6 +610,7 @@ async function saveRule() {
     await loadRules();
     renderRules();
     await refreshAuditIfLoaded();
+    await refreshRemIfLoaded();
     toast(id ? "规则已更新（提示：可到「策略对比」生成回放查看影响）" : "规则已创建");
   } catch (e) { fail(e); }
 }
@@ -745,6 +751,183 @@ function renderAudit() {
   renderAuditFilterOptions();
   renderAuditRules();
   renderAuditOverlaps();
+}
+
+// ---------------------------------------------------------------------------
+// Tab 3.6: 审计修复工作台（确定性建议 → 勾选草稿 → 单事务应用 → 可撤销）
+// ---------------------------------------------------------------------------
+
+async function loadRemData() {
+  const [s, h] = await Promise.all([
+    api("/api/rule-audit/suggestions"),
+    api("/api/rule-audit/remediations"),
+  ]);
+  state.remediate.meta = s;
+  state.remediate.suggestions = s.suggestions || [];
+  state.remediate.unsupported = s.unsupported || [];
+  state.remediate.history = h.runs || [];
+  state.remediate.canUndoId = h.can_undo_id;
+  // 规则可能已变化：丢弃已失效的勾选
+  const ids = new Set(state.remediate.suggestions.map((x) => x.id));
+  state.remediate.selected = new Set([...state.remediate.selected].filter((x) => ids.has(x)));
+  renderRemSuggestions();
+  renderRemHistory();
+}
+
+function remRuleChip(r) {
+  return `<span class="seq-chip">#${r.id} ${esc(r.name)}</span>`;
+}
+
+function renderRemSuggestions() {
+  const list = state.remediate.suggestions;
+  $("#rem-pending").textContent = `${list.length} 条待处理`;
+  const box = $("#rem-suggestions");
+  if (!list.length) {
+    box.innerHTML = '<p class="empty">当前没有可自动修复的审计关系——启用规则集状态良好。</p>';
+  } else {
+    box.innerHTML = list.map((s) => {
+      const checked = state.remediate.selected.has(s.id);
+      const ops = s.ops_text.map((t) => `<li>${esc(t)}</li>`).join("");
+      return `<div class="rem-card kind-${s.kind}${checked ? " selected" : ""}" data-rem-card="${esc(s.id)}">
+        <label class="rem-head">
+          <input type="checkbox" class="rem-check" data-rem-select="${esc(s.id)}" ${checked ? "checked" : ""}>
+          <div style="flex:1;min-width:0">
+            <div class="rem-title">
+              <span class="rem-kind kind-${s.kind}">${esc(s.kind_label)}</span>
+              <span class="audit-kind kind-${s.conflict_type}">${esc(s.conflict_label)}</span>
+              <b>${esc(s.summary)}</b>
+            </div>
+            <div class="audit-inter" style="margin:6px 0">交集可达条件：<b>${esc(s.intersection.summary)}</b></div>
+            <p class="audit-detail">${esc(s.detail)}</p>
+            <div class="rem-rules">影响规则：${remRuleChip(s.higher_rule)} ${remRuleChip(s.lower_rule)}</div>
+            <ul class="rem-ops">${ops}</ul>
+          </div>
+        </label>
+      </div>`;
+    }).join("");
+  }
+  const un = state.remediate.unsupported;
+  $("#rem-unsupported").innerHTML = un.length
+    ? `<p class="hint" style="margin-top:12px">以下 ${un.length} 组关系需人工决策，暂不提供自动建议：</p>` +
+      un.map((u) => `<div class="rem-unsupported-item">
+        <span class="audit-kind kind-${u.conflict_type}">${esc(u.conflict_label)}</span>
+        规则 <b>#${u.rule_ids[0]}</b> 与 <b>#${u.rule_ids[1]}</b> · ${esc(u.intersection.summary)} ·
+        <span style="color:var(--muted)">${esc(u.reason)}</span>
+      </div>`).join("")
+    : "";
+}
+
+async function applyRemediations() {
+  const ids = state.remediate.suggestions
+    .filter((s) => state.remediate.selected.has(s.id))
+    .map((s) => s.id);
+  if (!ids.length) return toast("请先勾选要应用的修复建议", true);
+  if (!confirm(`在同一事务中应用 ${ids.length} 条修复建议？\n系统会逐条执行并重新审计校验，任一校验失败将自动回滚，规则不会产生任何变化。`)) return;
+  try {
+    const r = await api("/api/rule-audit/remediations", {
+      method: "POST",
+      body: JSON.stringify({ suggestion_ids: ids, note: $("#rem-note").value.trim() }),
+    });
+    $("#rem-note").value = "";
+    state.remediate.selected.clear();
+    state.remediate.lastResult = r;
+    await loadRules(); renderRules();
+    await refreshAuditIfLoaded();
+    await loadRemData();
+    renderRemResult();
+    const d = r.diff;
+    toast(`修复 #${r.run_id} 已应用：${r.applied_count} 条生效 / ${r.skipped_count} 条跳过；审计关系 ${d.before_totals.overlaps} → ${d.after_totals.overlaps} 组`);
+  } catch (e) { fail(e); }
+}
+
+function renderRemResult() {
+  const r = state.remediate.lastResult;
+  const card = $("#rem-result-card");
+  if (!r) { card.style.display = "none"; return; }
+  card.style.display = "";
+  const d = r.diff, bt = d.before_totals, at = d.after_totals;
+  const relItem = (x) => `<li>
+    <span class="audit-kind kind-${x.conflict_type}">${esc(x.conflict_label)}</span>
+    规则 #${x.rule_ids.join(" / #")} · ${esc(x.intersection_summary)}</li>`;
+  $("#rem-result").innerHTML = `
+    <div class="summary" style="margin-top:0">
+      修复运行 <b>#${r.run_id}</b>${r.note ? ` · ${esc(r.note)}` : ""}：
+      启用规则 <b>${d.before_enabled} → ${d.after_enabled}</b> 条；
+      审计关系 <b>${bt.overlaps} → ${at.overlaps}</b> 组
+      （动作冲突 ${bt.action_conflict}→${at.action_conflict} ·
+        冷却差异 ${bt.cooldown_conflict}→${at.cooldown_conflict} ·
+        完全遮蔽 ${bt.shadowed}→${at.shadowed} ·
+        冗余重叠 ${bt.redundant_overlap}→${at.redundant_overlap}）；
+      消除关系 <b style="color:var(--green)">${d.removed_count}</b> 组，
+      新增关系 <b style="color:${d.added_count ? "var(--red)" : "var(--green)"}">${d.added_count}</b> 组。
+    </div>
+    <div class="rem-diff-grid">
+      <div>
+        <div class="audit-side-title">逐条执行结果</div>
+        <ul class="rem-diff-list">${r.results.map((x) => `<li>
+          <span class="badge ${x.status === "applied" ? "pass" : ""}">${x.status === "applied" ? "✔ 已应用" : "↷ 跳过"}</span>
+          <code>${esc(x.suggestion_id)}</code>
+          <div style="color:var(--muted);margin-top:2px">${esc(x.reason)}</div>
+        </li>`).join("")}</ul>
+      </div>
+      <div>
+        <div class="audit-side-title">已消除的审计关系（${d.removed_count}）</div>
+        <ul class="rem-diff-list">${d.removed.map(relItem).join("") || '<li class="empty">无</li>'}</ul>
+        <div class="audit-side-title" style="margin-top:10px">新增的审计关系（${d.added_count}）</div>
+        <ul class="rem-diff-list">${d.added.map(relItem).join("") || '<li class="empty">无（校验通过的必要条件）</li>'}</ul>
+      </div>
+    </div>`;
+}
+
+function renderRemHistory() {
+  const runs = state.remediate.history;
+  $("#rem-history-count").textContent = `${runs.length} 次修复`;
+  const box = $("#rem-history");
+  if (!runs.length) {
+    box.innerHTML = '<p class="empty">暂无修复记录。勾选上方建议并应用后，这里会显示历史与撤销入口。</p>';
+    return;
+  }
+  box.innerHTML = runs.map((run) => {
+    const d = run.diff;
+    const applied = run.results.filter((x) => x.status === "applied").length;
+    const skipped = run.results.length - applied;
+    const status = run.undone
+      ? `<span class="badge suppress">已撤销 ${esc(run.undone_at || "")}</span>`
+      : run.can_undo
+        ? `<button class="btn small danger" data-rem-undo="${run.id}">↩ 撤销本次修复</button>`
+        : '<span class="badge">已生效</span>';
+    const items = run.results.map((x) =>
+      `<li><span class="badge ${x.status === "applied" ? "pass" : ""}">${x.status === "applied" ? "✔" : "↷"}</span> <code>${esc(x.suggestion_id)}</code></li>`
+    ).join("");
+    return `<div class="rem-history-item${run.undone ? " is-undone" : ""}">
+      <div class="top">
+        <span><b>#${run.id}</b> ${esc(run.created_at)}${run.note ? ` · ${esc(run.note)}` : ""}</span>
+        <span>${status}</span>
+      </div>
+      <div class="meta">应用 ${applied} 条 / 跳过 ${skipped} 条 ·
+        审计关系 ${d.before_totals.overlaps} → ${d.after_totals.overlaps} 组（消除 ${d.removed_count}，新增 ${d.added_count}） ·
+        启用规则 ${d.before_enabled} → ${d.after_enabled} 条</div>
+      <ul class="rem-ops">${items}</ul>
+    </div>`;
+  }).join("");
+}
+
+async function undoRemediation(id) {
+  if (!confirm(`撤销修复 #${id}？\n规则表将恢复到该次修复前的快照（不影响任何 live/replay 历史决定）。`)) return;
+  try {
+    const r = await api(`/api/rule-audit/remediations/${id}/undo`, { method: "POST" });
+    await loadRules(); renderRules();
+    await refreshAuditIfLoaded();
+    await loadRemData();
+    toast(`修复 #${id} 已撤销：已恢复 ${r.restored_rules} 条规则`);
+  } catch (e) { fail(e); }
+}
+
+// 规则变更后若修复页已加载过，按当前规则重新生成建议
+async function refreshRemIfLoaded() {
+  if (state.remediate.meta) {
+    try { await loadRemData(); } catch (err) { fail(err); }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +1128,7 @@ document.addEventListener("click", async (e) => {
       await api(`/api/rules/${ds.toggleRule}/toggle`, { method: "POST" });
       await loadRules(); renderRules();
       await refreshAuditIfLoaded();
+      await refreshRemIfLoaded();
     }
     catch (err) { fail(err); }
   }
@@ -955,7 +1139,11 @@ document.addEventListener("click", async (e) => {
       if (Number($("#rule-id").value) === Number(ds.delRule)) fillRuleForm(null);
       await loadRules(); renderRules();
       await refreshAuditIfLoaded();
+      await refreshRemIfLoaded();
     } catch (err) { fail(err); }
+  }
+  if (ds.remUndo) {
+    await undoRemediation(Number(ds.remUndo));
   }
 });
 
@@ -965,6 +1153,16 @@ async function refreshAuditIfLoaded() {
     try { await loadAudit(); } catch (err) { fail(err); }
   }
 }
+
+// 勾选修复建议（事件委托：卡片重渲染后仍然生效）
+document.addEventListener("change", (e) => {
+  const t = e.target;
+  if (!t.dataset || !t.dataset.remSelect) return;
+  if (t.checked) state.remediate.selected.add(t.dataset.remSelect);
+  else state.remediate.selected.delete(t.dataset.remSelect);
+  const card = document.querySelector(`[data-rem-card="${CSS.escape(t.dataset.remSelect)}"]`);
+  if (card) card.classList.toggle("selected", t.checked);
+});
 
 function bind() {
   document.querySelectorAll(".tab").forEach((btn) => btn.addEventListener("click", () => {
@@ -976,6 +1174,7 @@ function bind() {
     if (btn.dataset.tab === "events") loadEvents().catch(fail);
     if (btn.dataset.tab === "evolution") loadSnapshots().catch(fail);
     if (btn.dataset.tab === "audit") loadAudit().catch(fail);
+    if (btn.dataset.tab === "remediate") loadRemData().catch(fail);
   }));
 
   $("#btn-inject-next").addEventListener("click", () => doInject(true));
@@ -1009,6 +1208,17 @@ function bind() {
   $("#audit-filter-rule").addEventListener("change", async (e) => {
     state.audit.filterRuleId = e.target.value ? Number(e.target.value) : null;
     try { await loadAudit(); } catch (err) { fail(err); }
+  });
+  $("#btn-rem-refresh").addEventListener("click", () =>
+    loadRemData().then(() => toast("建议已按当前启用规则重新生成")).catch(fail));
+  $("#btn-rem-apply").addEventListener("click", applyRemediations);
+  $("#btn-rem-all").addEventListener("click", () => {
+    state.remediate.suggestions.forEach((s) => state.remediate.selected.add(s.id));
+    renderRemSuggestions();
+  });
+  $("#btn-rem-none").addEventListener("click", () => {
+    state.remediate.selected.clear();
+    renderRemSuggestions();
   });
   $("#btn-replay").addEventListener("click", doReplay);
   $("#cmp-a").addEventListener("change", loadCompare);

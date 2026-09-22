@@ -35,6 +35,12 @@ from .engine import (
     normalize_rule,
     ordered_rules,
 )
+from .remediation import (
+    diff_audits,
+    generate_suggestions,
+    relation_fingerprint,
+    validate_remediation,
+)
 
 app = FastAPI(title="冷链告警抑制策略沙盒", version="1.0.0")
 
@@ -352,6 +358,245 @@ def rule_audit(rule_id: Optional[int] = None):
         result["overlaps_filtered"] = len(filtered)
         result["overlaps"] = filtered
         return result
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 规则审计修复工作台：确定性建议、单事务应用（失败自动回滚）、历史与撤销
+# ---------------------------------------------------------------------------
+
+def _audit_and_suggestions(conn):
+    """当前规则表 → 审计结果 + 确定性修复建议（只读计算）。"""
+    rows = conn.execute("SELECT * FROM rules ORDER BY priority, id").fetchall()
+    all_rules = [dict(r) for r in rows]
+    audit_result = audit_rules(all_rules)
+    sugg = generate_suggestions(audit_result, all_rules)
+    return all_rules, audit_result, sugg
+
+
+@app.get("/api/rule-audit/suggestions")
+def rule_audit_suggestions():
+    """基于当前启用规则的审计关系，生成确定性的合并/收窄/删除/停用建议（只读）。
+
+    同一规则集在任何时刻生成的建议完全一致；冷却差异类关系不生成自动建议，
+    在 ``unsupported`` 中单列。
+    """
+    conn = db.get_conn()
+    try:
+        _, audit_result, sugg = _audit_and_suggestions(conn)
+        return {
+            "enabled_rule_count": audit_result["enabled_rule_count"],
+            "overlap_count": len(audit_result["overlaps"]),
+            "pending_count": len(sugg["suggestions"]),
+            "suggestions": sugg["suggestions"],
+            "unsupported": sugg["unsupported"],
+        }
+    finally:
+        conn.close()
+
+
+def _apply_remediation_op(conn, op: dict) -> None:
+    """在事务内执行单个修复操作；任何校验失败抛异常，由调用方回滚。"""
+    kind = op.get("op")
+    rule_id = int(op.get("rule_id"))
+    if kind == "delete_rule":
+        cur = conn.execute("DELETE FROM rules WHERE id=?", (rule_id,))
+    elif kind == "disable_rule":
+        cur = conn.execute("UPDATE rules SET enabled=0 WHERE id=?", (rule_id,))
+    elif kind == "update_rule":
+        row = conn.execute("SELECT * FROM rules WHERE id=?", (rule_id,)).fetchone()
+        if not row:
+            raise HTTPException(409, f"规则 #{rule_id} 已不存在，修复无法应用")
+        payload = dict(row)
+        payload.update(op.get("set") or {})
+        try:
+            data = normalize_rule(payload)  # 与规则 CRUD 相同的校验
+        except ValueError as exc:
+            raise HTTPException(409, f"修复操作校验失败（规则 #{rule_id}）：{exc}")
+        sets = ", ".join(f"{k}=:{k}" for k in data)
+        data["id"] = rule_id
+        cur = conn.execute(f"UPDATE rules SET {sets} WHERE id=:id", data)
+    else:
+        raise HTTPException(400, f"未知修复操作: {kind}")
+    if cur.rowcount == 0:
+        raise HTTPException(409, f"规则 #{rule_id} 已不存在，修复无法应用")
+
+
+@app.post("/api/rule-audit/remediations")
+def apply_rule_remediation(payload: dict = Body(...)):
+    """在同一事务中应用勾选的修复建议草稿，并输出应用前后审计关系变化。
+
+    流程：快照规则表 → 记录应用前审计 → 按审计关系的确定性顺序逐条应用
+    （某条建议针对的关系若已被本次先前的修复消除，则标记为跳过）→ 重新
+    审计并校验（勾选的关系必须全部消除、不得新增可能改变结果的关系、
+    不得新增被完全遮蔽的规则）→ **任一校验失败自动回滚**；全部通过则
+    同事务写入修复记录并提交。只改规则，不回溯改写任何 live/replay 历史。
+    """
+    selected_ids = (payload or {}).get("suggestion_ids")
+    if not isinstance(selected_ids, list) or not selected_ids:
+        raise HTTPException(400, "suggestion_ids 必须是非空数组")
+    if not all(isinstance(s, str) for s in selected_ids):
+        raise HTTPException(400, "suggestion_ids 必须全部是字符串")
+    note = str((payload or {}).get("note", "")).strip()[:200]
+
+    conn = db.get_conn()
+    try:
+        all_rules, before, sugg = _audit_and_suggestions(conn)
+        by_id = {s["id"]: s for s in sugg["suggestions"]}
+        unknown = [sid for sid in selected_ids if sid not in by_id]
+        if unknown:
+            raise HTTPException(
+                409, "建议已失效（规则可能已变更），请刷新后重试: "
+                + ", ".join(str(s) for s in unknown)
+            )
+        wanted = set(selected_ids)
+        # 审计结果顺序即确定性应用顺序（按双方规则 id 稳定排序）
+        ordered = [s for s in sugg["suggestions"] if s["id"] in wanted]
+
+        snapshot = json.dumps(
+            [dict(r) for r in conn.execute("SELECT * FROM rules ORDER BY id").fetchall()],
+            ensure_ascii=False,
+        )
+
+        conn.execute("BEGIN")
+        try:
+            results = []
+            working = before
+            for s in ordered:
+                fp = s["relation_fingerprint"]
+                current_fps = {relation_fingerprint(o) for o in working["overlaps"]}
+                if fp not in current_fps:
+                    results.append({
+                        "suggestion_id": s["id"], "kind": s["kind"],
+                        "status": "skipped",
+                        "reason": "针对的审计关系已被本次草稿中先前的修复消除",
+                    })
+                    continue
+                for op in s["ops"]:
+                    _apply_remediation_op(conn, op)
+                rows = conn.execute(
+                    "SELECT * FROM rules ORDER BY priority, id"
+                ).fetchall()
+                working = audit_rules([dict(r) for r in rows])
+                results.append({
+                    "suggestion_id": s["id"], "kind": s["kind"],
+                    "status": "applied",
+                    "reason": "已应用：" + "；".join(s["ops_text"]),
+                })
+            after = working
+            errors = validate_remediation(before, after, ordered)
+            if errors:
+                raise HTTPException(409, "修复校验失败，已自动回滚：" + "；".join(errors))
+            diff = diff_audits(before, after)
+            cur = conn.execute(
+                """INSERT INTO remediation_runs(note, selected_json, results_json,
+                   diff_json, before_audit, after_audit, rules_snapshot)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    note,
+                    json.dumps([s["id"] for s in ordered], ensure_ascii=False),
+                    json.dumps(results, ensure_ascii=False),
+                    json.dumps(diff, ensure_ascii=False),
+                    json.dumps(before, ensure_ascii=False),
+                    json.dumps(after, ensure_ascii=False),
+                    snapshot,
+                ),
+            )
+            run_id = cur.lastrowid
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return {
+            "run_id": run_id,
+            "note": note,
+            "results": results,
+            "applied_count": sum(1 for r in results if r["status"] == "applied"),
+            "skipped_count": sum(1 for r in results if r["status"] == "skipped"),
+            "diff": diff,
+        }
+    finally:
+        conn.close()
+
+
+def _remediation_run_dict(row, can_undo_id: Optional[int]) -> dict:
+    return {
+        "id": row["id"],
+        "note": row["note"] or "",
+        "created_at": row["created_at"],
+        "selected": json.loads(row["selected_json"]),
+        "results": json.loads(row["results_json"]),
+        "diff": json.loads(row["diff_json"]),
+        "undone": bool(row["undone"]),
+        "undone_at": row["undone_at"],
+        "can_undo": (not row["undone"]) and row["id"] == can_undo_id,
+    }
+
+
+@app.get("/api/rule-audit/remediations")
+def list_rule_remediations():
+    """修复历史（最新在前）；只有最近一次未撤销的修复可以撤销。"""
+    conn = db.get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM remediation_runs ORDER BY id DESC"
+        ).fetchall()
+        latest = conn.execute(
+            "SELECT id FROM remediation_runs WHERE undone=0 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        can_undo_id = latest["id"] if latest else None
+        return {
+            "runs": [_remediation_run_dict(r, can_undo_id) for r in rows],
+            "can_undo_id": can_undo_id,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/rule-audit/remediations/{run_id}/undo")
+def undo_rule_remediation(run_id: int):
+    """撤销最近一次修复：在同一事务中把规则表整体恢复到该次修复前的快照。"""
+    conn = db.get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM remediation_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "修复记录不存在")
+        latest = conn.execute(
+            "SELECT id FROM remediation_runs WHERE undone=0 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not latest or latest["id"] != run_id:
+            raise HTTPException(409, "只能撤销最近一次未撤销的修复")
+        snapshot = json.loads(row["rules_snapshot"])
+        conn.execute("BEGIN")
+        try:
+            conn.execute("DELETE FROM rules")
+            for r in snapshot:
+                cols = list(r.keys())
+                conn.execute(
+                    f"INSERT INTO rules({', '.join(cols)}) "
+                    f"VALUES ({', '.join(':' + c for c in cols)})",
+                    r,
+                )
+            conn.execute(
+                "UPDATE remediation_runs SET undone=1, undone_at=datetime('now') "
+                "WHERE id=?",
+                (run_id,),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        rows = conn.execute("SELECT * FROM rules ORDER BY priority, id").fetchall()
+        restored = audit_rules([dict(r) for r in rows])
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "restored_rules": len(snapshot),
+            "audit_totals": restored["totals"],
+        }
     finally:
         conn.close()
 
