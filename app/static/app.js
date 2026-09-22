@@ -23,6 +23,7 @@ let state = {
   snapshots: [],
   snapCompare: { from: null, to: null, result: null },
   audit: { result: null, filterRuleId: null },
+  fix: { data: null, selected: new Set(), lastResult: null },
 };
 
 function eventFilters() {
@@ -605,6 +606,7 @@ async function saveRule() {
     await loadRules();
     renderRules();
     await refreshAuditIfLoaded();
+    await refreshFixIfLoaded();
     toast(id ? "规则已更新（提示：可到「策略对比」生成回放查看影响）" : "规则已创建");
   } catch (e) { fail(e); }
 }
@@ -745,6 +747,173 @@ function renderAudit() {
   renderAuditFilterOptions();
   renderAuditRules();
   renderAuditOverlaps();
+}
+
+// ---------------------------------------------------------------------------
+// Tab 3.6: 修复工作台（确定性建议、单事务应用、最近一次修复撤销）
+// ---------------------------------------------------------------------------
+
+async function loadFixes() {
+  state.fix.data = await api("/api/rule-audit/fixes");
+  // 规则变更后建议会重新生成：丢弃已失效的勾选
+  const valid = new Set(state.fix.data.suggestions.map((s) => s.id));
+  state.fix.selected = new Set([...state.fix.selected].filter((id) => valid.has(id)));
+  renderFixes();
+}
+
+function fixRelPair(r) {
+  const [a, b] = r.rule_ids;
+  return `#${Math.min(a, b)} ↔ #${Math.max(a, b)}`;
+}
+
+function fixRelList(items, empty) {
+  if (!items.length) return `<li>${empty}</li>`;
+  return items.map((r) => `<li>${fixRelPair(r)}（${esc(r.conflict_label)}）</li>`).join("");
+}
+
+function fixSuggestionHtml(s) {
+  const checked = state.fix.selected.has(s.id) ? "checked" : "";
+  const resolved = s.preview.resolved_count
+    ? `<span class="badge pass">✓ 解决 ${s.preview.resolved_count} 组</span>` : "";
+  const introduced = s.preview.introduced_count
+    ? `<span class="badge suppress">⚠ 新增 ${s.preview.introduced_count} 组</span>` : "";
+  return `<div class="fix-card kind-${s.conflict_type}">
+    <label class="fix-check"><input type="checkbox" data-fix-select="${s.id}" ${checked}></label>
+    <div class="fix-body">
+      <div class="fix-head">
+        <span class="fix-kind kind-${s.kind}">${s.kind_label}</span>
+        <span class="audit-kind kind-${s.conflict_type}">${s.conflict_label}</span>
+        <b>${esc(s.title)}</b>
+      </div>
+      <div class="fix-detail">${esc(s.detail)}</div>
+      <div class="fix-meta">
+        <span>影响规则 ${s.affected_rule_ids.map((id) => `<span class="seq-chip">#${id}</span>`).join(" ")}</span>
+        <span>针对关系 ${fixRelPair({ rule_ids: s.rule_ids })}</span>
+        ${resolved}${introduced}
+      </div>
+      <details class="fix-preview">
+        <summary>确定性预演（单独应用该建议后的审计变化）</summary>
+        <div class="fix-preview-grid">
+          <div><b>解决的关系</b><ul>${fixRelList(s.preview.resolved, "无")}</ul></div>
+          <div><b>新增的关系</b><ul>${fixRelList(s.preview.introduced, "无")}</ul></div>
+        </div>
+      </details>
+    </div>
+  </div>`;
+}
+
+function fixHistoryHtml(f) {
+  const stateBadge = f.undone
+    ? `<span class="badge">已撤销${f.undone_at ? ` · ${esc(f.undone_at)}` : ""}</span>`
+    : '<span class="badge pass">已应用</span>';
+  const kinds = f.suggestions.map((s) =>
+    `<span class="fix-kind kind-${s.kind}">${esc(s.kind_label)}</span>`).join(" ");
+  return `<div class="snapshot-item" style="display:block">
+    <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
+      <span><b>#${f.id}</b> ${esc(f.summary)}</span>
+      <span>${stateBadge}</span>
+    </div>
+    <div style="color:var(--muted);margin-top:4px">
+      ${esc(f.created_at)} · ${kinds} · 影响规则 ${f.affected_rule_ids.map((id) => `#${id}`).join("、")}
+      · 关系 ${f.diff.before_total} → ${f.diff.after_total}
+      （解决 ${f.diff.resolved_count}${f.diff.introduced_count ? ` · 新增 ${f.diff.introduced_count}` : ""}）
+    </div>
+  </div>`;
+}
+
+function updateFixButtons() {
+  $("#btn-fix-apply").disabled = !state.fix.selected.size;
+  $("#btn-fix-apply").textContent = state.fix.selected.size
+    ? `✅ 应用选中的 ${state.fix.selected.size} 条建议` : "✅ 应用选中的建议";
+  const undoId = state.fix.data?.latest_undoable_id;
+  $("#btn-fix-undo").disabled = !undoId;
+  $("#btn-fix-undo").textContent = undoId ? `↩ 撤销最近一次修复 (#${undoId})` : "↩ 撤销最近一次修复";
+}
+
+function renderFixes() {
+  const d = state.fix.data;
+  if (!d) return;
+  const t = d.audit_totals;
+  $("#fix-sug-count").textContent = `${d.suggestions.length} 条待处理建议`;
+  $("#fix-relation-count").textContent = `${t.overlaps} 组审计关系`;
+  $("#fix-undo-state").textContent = d.latest_undoable_id
+    ? `可撤销修复 #${d.latest_undoable_id}` : "无可撤销修复";
+  $("#fix-summary").innerHTML =
+    `当前 <b>${d.enabled_rule_count}</b> 条启用规则存在 <b>${t.overlaps}</b> 组审计关系
+     （动作冲突 ${t.action_conflict} · 完全遮蔽 ${t.shadowed} · 冗余重叠 ${t.redundant_overlap} ·
+     冷却差异 ${t.cooldown_conflict}），其中可自动修复的关系已生成
+     <b>${d.suggestions.length}</b> 条建议。`;
+
+  const box = $("#fix-suggestions");
+  box.innerHTML = d.suggestions.length
+    ? d.suggestions.map(fixSuggestionHtml).join("")
+    : '<p class="empty">没有待处理建议——当前启用规则之间不存在可自动修复的审计关系。</p>';
+
+  $("#fix-history-count").textContent = `${d.fixes.length} 条记录`;
+  $("#fix-history").innerHTML = d.fixes.length
+    ? d.fixes.map(fixHistoryHtml).join("")
+    : '<p class="empty">暂无修复记录。勾选建议并应用后，这里会展示每次修复的前后关系变化。</p>';
+  updateFixButtons();
+}
+
+function renderFixResult() {
+  const r = state.fix.lastResult;
+  if (!r) return;
+  $("#fix-result-card").hidden = false;
+  const d = r.diff;
+  const relRow = (o, mark) => `<tr>
+    <td>${mark}</td><td>#${Math.min(...o.rule_ids)} ↔ #${Math.max(...o.rule_ids)}</td>
+    <td><span class="audit-kind kind-${o.conflict_type}">${o.conflict_label}</span></td>
+    <td style="color:var(--muted);font-size:12px">${esc(o.intersection.summary)}</td>
+  </tr>`;
+  $("#fix-result").innerHTML =
+    `<p class="hint" style="margin-bottom:8px">修复 <b>#${r.fix_id}</b>（${esc(r.summary)}）已在同一事务中应用：
+     审计关系 <b>${d.before_total}</b> → <b>${d.after_total}</b> 组，
+     解决 <b style="color:var(--green)">${d.resolved_count}</b> 组，
+     新增 <b style="color:${d.introduced_count ? "var(--red)" : "var(--green)"}">${d.introduced_count}</b> 组，
+     仍存在 ${d.remaining_count} 组。</p>
+     <div class="table-wrap"><table>
+       <thead><tr><th>变化</th><th>规则对</th><th>类型</th><th>交集可达条件</th></tr></thead>
+       <tbody>
+         ${d.resolved.map((o) => relRow(o, '<span class="badge pass">✓ 已解决</span>')).join("")}
+         ${d.introduced.map((o) => relRow(o, '<span class="badge suppress">⚠ 新增</span>')).join("")}
+       </tbody>
+     </table></div>`;
+}
+
+async function applyFixes() {
+  const ids = [...state.fix.selected];
+  if (!ids.length) return toast("请先勾选要应用的建议", true);
+  if (!confirm(`在同一事务中应用 ${ids.length} 条建议？\n任一校验失败（建议失效/相互冲突/结果校验不通过）都会自动回滚。`)) return;
+  try {
+    const r = await api("/api/rule-audit/fixes/apply", {
+      method: "POST", body: JSON.stringify({ suggestion_ids: ids }),
+    });
+    state.fix.lastResult = r;
+    state.fix.selected = new Set();
+    await loadFixes();
+    await loadRules(); renderRules();
+    await refreshAuditIfLoaded();
+    renderFixResult();
+    toast(`修复 #${r.fix_id} 已应用：关系 ${r.diff.before_total} → ${r.diff.after_total} 组` +
+      (r.diff.introduced_count ? `（新增 ${r.diff.introduced_count} 组）` : ""));
+  } catch (e) {
+    fail(e);
+    await loadFixes().catch(() => {});
+  }
+}
+
+async function undoFix() {
+  const id = state.fix.data?.latest_undoable_id;
+  if (!id) return;
+  if (!confirm(`撤销最近一次修复 #${id}？\n受影响规则将恢复到修复前状态（撤销前会校验修复后未被手动修改）。`)) return;
+  try {
+    const r = await api(`/api/rule-audit/fixes/${id}/undo`, { method: "POST" });
+    await loadFixes();
+    await loadRules(); renderRules();
+    await refreshAuditIfLoaded();
+    toast(`修复 #${id} 已撤销，规则 ${r.restored_rule_ids.map((x) => `#${x}`).join("、")} 已恢复`);
+  } catch (e) { fail(e); }
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +1114,7 @@ document.addEventListener("click", async (e) => {
       await api(`/api/rules/${ds.toggleRule}/toggle`, { method: "POST" });
       await loadRules(); renderRules();
       await refreshAuditIfLoaded();
+      await refreshFixIfLoaded();
     }
     catch (err) { fail(err); }
   }
@@ -955,7 +1125,17 @@ document.addEventListener("click", async (e) => {
       if (Number($("#rule-id").value) === Number(ds.delRule)) fillRuleForm(null);
       await loadRules(); renderRules();
       await refreshAuditIfLoaded();
+      await refreshFixIfLoaded();
     } catch (err) { fail(err); }
+  }
+});
+
+document.addEventListener("change", (e) => {
+  const ds = e.target.dataset || {};
+  if (ds.fixSelect) {
+    if (e.target.checked) state.fix.selected.add(ds.fixSelect);
+    else state.fix.selected.delete(ds.fixSelect);
+    updateFixButtons();
   }
 });
 
@@ -963,6 +1143,13 @@ document.addEventListener("click", async (e) => {
 async function refreshAuditIfLoaded() {
   if (state.audit.result) {
     try { await loadAudit(); } catch (err) { fail(err); }
+  }
+}
+
+// 规则变更后若修复工作台已加载过，重新生成建议并丢弃失效勾选
+async function refreshFixIfLoaded() {
+  if (state.fix.data) {
+    try { await loadFixes(); } catch (err) { fail(err); }
   }
 }
 
@@ -976,6 +1163,7 @@ function bind() {
     if (btn.dataset.tab === "events") loadEvents().catch(fail);
     if (btn.dataset.tab === "evolution") loadSnapshots().catch(fail);
     if (btn.dataset.tab === "audit") loadAudit().catch(fail);
+    if (btn.dataset.tab === "fix") loadFixes().catch(fail);
   }));
 
   $("#btn-inject-next").addEventListener("click", () => doInject(true));
@@ -1010,6 +1198,10 @@ function bind() {
     state.audit.filterRuleId = e.target.value ? Number(e.target.value) : null;
     try { await loadAudit(); } catch (err) { fail(err); }
   });
+  $("#btn-fix-refresh").addEventListener("click", () =>
+    loadFixes().then(() => toast("建议已按当前规则重新生成")).catch(fail));
+  $("#btn-fix-apply").addEventListener("click", applyFixes);
+  $("#btn-fix-undo").addEventListener("click", undoFix);
   $("#btn-replay").addEventListener("click", doReplay);
   $("#cmp-a").addEventListener("change", loadCompare);
   $("#cmp-b").addEventListener("change", loadCompare);

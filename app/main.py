@@ -1,4 +1,4 @@
-"""FastAPI 主应用：规则 CRUD、告警注入/撤销、策略回放对比、内置模拟接收端。
+"""FastAPI 主应用：规则 CRUD、告警注入/撤销、策略回放对比、规则审计修复、内置模拟接收端。
 
 默认数据文件位于 ./data/sandbox.db，可用环境变量 SANDBOX_DATA 覆盖。
 """
@@ -35,8 +35,16 @@ from .engine import (
     normalize_rule,
     ordered_rules,
 )
+from .fix import (
+    ALLOWED_OP_FIELDS,
+    audit_diff,
+    brief_relation,
+    check_compatible,
+    generate_suggestions,
+    relation_key,
+)
 
-app = FastAPI(title="冷链告警抑制策略沙盒", version="1.0.0")
+app = FastAPI(title="冷链告警抑制策略沙盒", version="1.1.0")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -352,6 +360,249 @@ def rule_audit(rule_id: Optional[int] = None):
         result["overlaps_filtered"] = len(filtered)
         result["overlaps"] = filtered
         return result
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 规则审计修复工作台：确定性建议、单事务应用（失败回滚）、最近一次修复撤销
+# ---------------------------------------------------------------------------
+
+def _rule_snapshot(row) -> dict:
+    """受影响规则的完整快照（撤销时逐字段比对/恢复用）。"""
+    return {c: row[c] for c in db._RULE_COLS}
+
+
+def _fix_record_dict(row) -> dict:
+    before = json.loads(row["audit_before"])
+    after = json.loads(row["audit_after"])
+    diff = audit_diff(before, after)
+    return {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "summary": row["summary"],
+        "undone": bool(row["undone"]),
+        "undone_at": row["undone_at"],
+        "affected_rule_ids": json.loads(row["affected_rule_ids"]),
+        "suggestions": json.loads(row["ops_json"]),
+        "diff": {
+            "resolved": [brief_relation(o) for o in diff["resolved"]],
+            "introduced": [brief_relation(o) for o in diff["introduced"]],
+            "resolved_count": diff["resolved_count"],
+            "introduced_count": diff["introduced_count"],
+            "before_total": diff["before_total"],
+            "after_total": diff["after_total"],
+        },
+    }
+
+
+@app.get("/api/rule-audit/fixes")
+def list_rule_fixes():
+    """修复工作台数据：待处理建议（含确定性预演）+ 修复历史 + 可撤销的最近修复。
+
+    建议基于当前规则集实时重新生成（内容哈希 id，规则不变则 id 不变），
+    只读计算，不修改任何数据。
+    """
+    conn = db.get_conn()
+    try:
+        rule_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM rules ORDER BY priority, id"
+        ).fetchall()]
+        audit = audit_rules(rule_rows)
+        suggestions = generate_suggestions(rule_rows)
+        rows = conn.execute(
+            "SELECT * FROM rule_fixes ORDER BY id DESC LIMIT 20"
+        ).fetchall()
+        latest = conn.execute(
+            "SELECT id FROM rule_fixes WHERE undone=0 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return {
+            "suggestions": suggestions,
+            "fixes": [_fix_record_dict(r) for r in rows],
+            "latest_undoable_id": latest["id"] if latest else None,
+            "audit_totals": audit["totals"],
+            "enabled_rule_count": audit["enabled_rule_count"],
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/rule-audit/fixes/apply")
+def apply_rule_fixes(payload: dict = Body(...)):
+    """在同一事务中应用勾选的建议草稿，输出应用前后的审计关系变化。
+
+    校验（任一失败即整体回滚，不产生任何写入）：
+    建议 id 全部有效（未因规则变更而过期）、建议两两不冲突、目标规则仍启用、
+    修复后规则通过 normalize_rule 校验、每条建议针对的审计关系确实消除。
+    """
+    ids = (payload or {}).get("suggestion_ids")
+    if not isinstance(ids, list) or not ids \
+            or not all(isinstance(x, str) for x in ids):
+        raise HTTPException(400, "需要非空的 suggestion_ids 数组")
+    if len(set(ids)) != len(ids):
+        raise HTTPException(400, "suggestion_ids 存在重复")
+
+    conn = db.get_conn()
+    try:
+        rule_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM rules ORDER BY priority, id"
+        ).fetchall()]
+        audit_before = audit_rules(rule_rows)
+        suggestions = generate_suggestions(rule_rows)
+        by_id = {s["id"]: s for s in suggestions}
+        missing = [x for x in ids if x not in by_id]
+        if missing:
+            raise HTTPException(
+                409, f"建议已失效（规则可能刚被修改），请刷新后重试: {', '.join(missing)}"
+            )
+        selected = [s for s in suggestions if s["id"] in set(ids)]  # 按生成顺序，确定性
+        conflict = check_compatible(selected)
+        if conflict:
+            raise HTTPException(400, conflict)
+
+        updated_ids: list[int] = []
+        conn.execute("BEGIN")
+        try:
+            for s in selected:
+                for op in s["ops"]:
+                    rid = int(op["rule_id"])
+                    row = conn.execute(
+                        "SELECT enabled FROM rules WHERE id=?", (rid,)
+                    ).fetchone()
+                    if row is None or not row["enabled"]:
+                        raise HTTPException(409, f"规则 #{rid} 不存在或已停用，建议已失效")
+                    if op["op"] == "disable_rule":
+                        conn.execute("UPDATE rules SET enabled=0 WHERE id=?", (rid,))
+                    elif op["op"] == "update_rule":
+                        fields = op["fields"]
+                        unknown = set(fields) - ALLOWED_OP_FIELDS
+                        if unknown:
+                            raise HTTPException(500, f"建议包含未知字段: {sorted(unknown)}")
+                        sets = ", ".join(f"{k}=:{k}" for k in fields)
+                        conn.execute(
+                            f"UPDATE rules SET {sets} WHERE id=:__rid",
+                            {**fields, "__rid": rid},
+                        )
+                        updated_ids.append(rid)
+                    else:
+                        raise HTTPException(500, f"未知操作类型: {op['op']}")
+
+            # 校验 1：被修改的规则仍能通过规则校验（非法则回滚）
+            for rid in updated_ids:
+                row = conn.execute("SELECT * FROM rules WHERE id=?", (rid,)).fetchone()
+                try:
+                    normalize_rule(dict(row))
+                except ValueError as exc:
+                    raise HTTPException(422, f"修复后规则 #{rid} 未通过校验: {exc}")
+
+            # 校验 2：每条建议针对的审计关系必须确实消除（否则回滚）
+            after_rows = [dict(r) for r in conn.execute("SELECT * FROM rules").fetchall()]
+            audit_after = audit_rules(after_rows)
+            remaining = {relation_key(o) for o in audit_after["overlaps"]}
+            for s in selected:
+                if tuple(s["relation_key"]) in remaining:
+                    raise HTTPException(
+                        500, f"应用后关系 {s['relation_key']} 仍存在，校验失败"
+                    )
+
+            diff = audit_diff(audit_before, audit_after)
+            summary = "；".join(s["title"] for s in selected)[:200]
+            affected = sorted({rid for s in selected for rid in s["affected_rule_ids"]})
+            rules_before = [_rule_snapshot(r) for r in rule_rows if r["id"] in affected]
+            rules_after = [_rule_snapshot(r) for r in after_rows if r["id"] in affected]
+            cur = conn.execute(
+                """INSERT INTO rule_fixes(summary, suggestion_ids, ops_json,
+                   affected_rule_ids, rules_before, rules_after, audit_before, audit_after)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    summary,
+                    json.dumps([s["id"] for s in selected], ensure_ascii=False),
+                    json.dumps(
+                        [{"id": s["id"], "kind": s["kind"], "kind_label": s["kind_label"],
+                          "title": s["title"], "ops": s["ops"]} for s in selected],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(affected),
+                    json.dumps(rules_before, ensure_ascii=False),
+                    json.dumps(rules_after, ensure_ascii=False),
+                    json.dumps(audit_before, ensure_ascii=False),
+                    json.dumps(audit_after, ensure_ascii=False),
+                ),
+            )
+            fix_id = cur.lastrowid
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return {
+            "ok": True,
+            "fix_id": fix_id,
+            "summary": summary,
+            "applied": [{"id": s["id"], "kind": s["kind"],
+                         "kind_label": s["kind_label"], "title": s["title"]}
+                        for s in selected],
+            "diff": diff,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/rule-audit/fixes/{fix_id}/undo")
+def undo_rule_fix(fix_id: int):
+    """撤销最近一次修复：把受影响规则恢复到修复前快照（单事务）。
+
+    仅允许撤销最近一次未撤销的修复；撤销前逐字段校验受影响规则的当前状态
+    与修复后快照一致（即修复后未被手动改动），不一致则拒绝撤销。
+    """
+    conn = db.get_conn()
+    try:
+        fix = conn.execute("SELECT * FROM rule_fixes WHERE id=?", (fix_id,)).fetchone()
+        if not fix:
+            raise HTTPException(404, "修复记录不存在")
+        if fix["undone"]:
+            raise HTTPException(409, "该修复已撤销过")
+        latest = conn.execute(
+            "SELECT id FROM rule_fixes WHERE undone=0 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not latest or latest["id"] != fix_id:
+            raise HTTPException(409, "只能撤销最近一次未撤销的修复")
+
+        rules_before = json.loads(fix["rules_before"])
+        rules_after = json.loads(fix["rules_after"])
+        for expected in rules_after:
+            cur = conn.execute(
+                "SELECT * FROM rules WHERE id=?", (expected["id"],)
+            ).fetchone()
+            if cur is None:
+                raise HTTPException(409, f"规则 #{expected['id']} 已被删除，无法安全撤销")
+            current = _rule_snapshot(cur)
+            if any(current[c] != expected[c] for c in db._RULE_COLS):
+                raise HTTPException(
+                    409, f"规则 #{expected['id']} 在修复后被手动修改，无法安全撤销"
+                )
+
+        conn.execute("BEGIN")
+        try:
+            for before in rules_before:
+                sets = ", ".join(f"{c}=:{c}" for c in db._RULE_COLS if c != "id")
+                conn.execute(f"UPDATE rules SET {sets} WHERE id=:id", before)
+            conn.execute(
+                "UPDATE rule_fixes SET undone=1, undone_at=datetime('now') WHERE id=?",
+                (fix_id,),
+            )
+            audit_now = audit_rules(
+                [dict(r) for r in conn.execute("SELECT * FROM rules").fetchall()]
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return {
+            "ok": True,
+            "fix_id": fix_id,
+            "restored_rule_ids": [r["id"] for r in rules_before],
+            "audit_totals": audit_now["totals"],
+        }
     finally:
         conn.close()
 

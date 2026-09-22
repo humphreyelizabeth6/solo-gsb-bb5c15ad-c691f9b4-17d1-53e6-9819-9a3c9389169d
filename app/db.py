@@ -132,6 +132,24 @@ CREATE TABLE IF NOT EXISTS event_snapshot_items (
     acked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snapshot_items ON event_snapshot_items(snapshot_id, ord);
+
+-- 规则审计修复工作台：每次应用草稿生成一条修复记录，保存应用前后的完整审计
+-- 关系与受影响规则快照，支持最近一次修复的确定性撤销（校验修复后规则未被
+-- 手动改动）；仅 /api/reset 恢复出厂时随业务数据一并清空。
+CREATE TABLE IF NOT EXISTS rule_fixes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    summary TEXT NOT NULL DEFAULT '',
+    suggestion_ids TEXT NOT NULL,        -- JSON: 应用的建议 id 列表
+    ops_json TEXT NOT NULL,              -- JSON: 应用的建议快照（kind/title/ops）
+    affected_rule_ids TEXT NOT NULL,     -- JSON: 被写入的规则 id
+    rules_before TEXT NOT NULL,          -- JSON: 受影响规则修复前完整行
+    rules_after TEXT NOT NULL,           -- JSON: 受影响规则修复后完整行
+    audit_before TEXT NOT NULL,          -- JSON: 应用前完整审计结果
+    audit_after TEXT NOT NULL,           -- JSON: 应用后完整审计结果
+    undone INTEGER NOT NULL DEFAULT 0,
+    undone_at TEXT
+);
 """
 
 _RULE_COLS = [
@@ -277,7 +295,8 @@ def reset_all(conn) -> None:
         conn.executescript(
             "DELETE FROM decisions; DELETE FROM receiver_logs; DELETE FROM staged; "
             "DELETE FROM alerts; DELETE FROM rules; DELETE FROM runs; DELETE FROM events; "
-            "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots;"
+            "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots; "
+            "DELETE FROM rule_fixes;"
         )
         inserted_ids = []
         for rule in seed_rules():
@@ -329,7 +348,8 @@ def init_db(force_seed: bool = False) -> None:
                         "DELETE FROM decisions; DELETE FROM receiver_logs; "
                         "DELETE FROM staged; DELETE FROM alerts; DELETE FROM rules; "
                         "DELETE FROM runs; DELETE FROM events; "
-                        "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots;"
+                        "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots; "
+                        "DELETE FROM rule_fixes;"
                     )
                 for rule in seed_rules():
                     conn.execute(
